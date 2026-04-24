@@ -1,1 +1,15 @@
+# Virtual environment
+robot_env/
+venv/
 
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# VS Code settings
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
