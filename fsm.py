@@ -1,118 +1,163 @@
+#!/usr/bin/env python
+import sys
+import os
 import time
-import numpy as np
-from brainflow.board_shim import BoardShim, BrainFlowInputParams, BoardIds
-from vassar_feetech_servo_sdk import ServoController
+import threading
+import termios
+import tty
 
-# --- CONFIGURATION ---
-PORT = '/dev/ttyUSB0'
-JOINT_IDS = [1, 2, 3, 4, 5, 6]
+# Add parent directory to path to import so101_api
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from so101_api import SO101ARM
 
-# Thresholds (Tune these by watching the terminal while resting vs flexing)
-THRESH_BICEP = 150.0  
-THRESH_FIST = 150.0   
-COOLDOWN = 2.0 # Seconds to wait after a trigger
+class FSMController:
+    def __init__(self, arm_instance):
+        self.arm = arm_instance
+        self.current_state = "HOME"
+        self.target_task = None  # Can be "A", "B", "ABORT", or None
+        self.running = True
+        self.holding_object = False
 
-# --- ROBOT POSITIONS (From your Kinesthetic Teaching) ---
-POSE_HOME = {1: 2048, 2: 2048, 3: 2048, 4: 2048, 5: 2048, 6: 2048}
-POSE_PICK = {1: 1500, 2: 1800, 3: 1500, 4: 2048, 5: 2048, 6: 2048}
-POSE_PLACE = {1: 2500, 2: 1800, 3: 1500, 4: 2048, 5: 2048, 6: 2048}
+        # Input threading setup
+        self.input_thread = threading.Thread(target=self._keyboard_listener_thread)
+        self.input_thread.daemon = True
 
-# Gripper States (Assuming joint 6 is the gripper)
-GRIP_OPEN = 1200
-GRIP_CLOSED = 2500
+    def start(self):
+        self.arm.connect()
+        self.holding_object = self.arm.is_grasping()
+        
+        print("\n--- FSM Controller Started ---")
+        print("Controls: '1' = Go to A | '2' = Go to B | 'q' = Abort/Home | 'esc' = Exit")
+        
+        self.input_thread.start()
+        self._run_fsm_loop()
 
-def calculate_rms(data_chunk):
-    return np.sqrt(np.mean(np.square(data_chunk)))
+    def _get_waypoint_name(self, loc, z_level):
+        """Generates waypoint string based on current grip state."""
+        grip_state = "grip" if self.holding_object else "open"
+        return f"{loc}_{z_level}_{grip_state}"
 
-def initialize_hardware():
-    # 1. Init Robot
-    controller = ServoController(servo_ids=JOINT_IDS, servo_type="sts")
-    controller.connect()
-    controller.write_position(POSE_HOME, speed=30, acceleration=20)
-    
-    # 2. Init OpenBCI
-    params = BrainFlowInputParams()
-    params.serial_port = PORT
-    board = BoardShim(BoardIds.CYTON_BOARD, params)
-    board.prepare_session()
-    board.start_stream()
-    
-    return controller, board
+    def _run_fsm_loop(self):
+        active_loc = None  # Tracks which location we are actively processing
+        
+        try:
+            while self.running:
+                self.holding_object = self.arm.is_grasping()
 
-def run_toggle_fsm():
-    controller, board = initialize_hardware()
-    
-    # State Trackers
-    pos_state = 0       # 0: Home, 1: Pick, 2: Place
-    gripper_open = True # True: Open, False: Closed
-    last_trigger_time = 0
-    
-    print("\n--- System Ready ---")
-    print("Flex Bicep -> Cycle Position (Home -> Pick -> Place)")
-    print("Make Fist  -> Toggle Gripper (Open/Close)")
-    
-    try:
-        while True:
-            data = board.get_board_data()
-            
-            if data.shape[1] > 0:
-                # Cyton indices: Ch1 is row 1, Ch2 is row 2
-                rms_bicep = calculate_rms(data[1, :])
-                rms_fist = calculate_rms(data[2, :])
-                
-                print(f"Bicep RMS: {rms_bicep:.0f} | Fist RMS: {rms_fist:.0f}", end='\r')
-                
-                # Check for triggers (if cooldown has passed)
-                if (time.time() - last_trigger_time) > COOLDOWN:
+                if self.current_state == "HOME":
+                    if self.target_task in ["A", "B"]:
+                        active_loc = self.target_task
+                        self.current_state = "APPROACHING_TARGET"
+
+                # --- GENERIC LOCATION LOGIC ---
+                elif self.current_state == "APPROACHING_TARGET":
+                    wp = self._get_waypoint_name(active_loc, "top")
+                    self.arm.move_to(wp, wait=True)
                     
-                    # TRIGGER 1: BICEP FLEX (Cycle Positions)
-                    if rms_bicep > THRESH_BICEP:
-                        print(f"\n[ BICEP TRIGGER ] Moving Arm...")
-                        
-                        # We must preserve the current gripper state when moving the arm
-                        current_grip_val = GRIP_OPEN if gripper_open else GRIP_CLOSED
-                        
-                        if pos_state == 0:
-                            pose = POSE_PICK.copy()
-                            pos_state = 1
-                        elif pos_state == 1:
-                            pose = POSE_PLACE.copy()
-                            pos_state = 2
-                        else:
-                            pose = POSE_HOME.copy()
-                            pos_state = 0
-                            
-                        # Inject the correct gripper value into the new pose
-                        pose[6] = current_grip_val 
-                        controller.write_position(pose, speed=40, acceleration=30)
-                        last_trigger_time = time.time()
+                    if self.target_task != active_loc:
+                        print(f"\n[FSM] Interrupted at {active_loc}_top. Routing Home.")
+                        self.current_state = "HOME"
+                        self.arm.move_to("home", wait=True) #addition. needed?
+                    else:
+                        self.current_state = "DESCENDING_TARGET"
+
+                elif self.current_state == "DESCENDING_TARGET":
+                    wp = self._get_waypoint_name(active_loc, "bot")
+                    self.arm.move_to(wp, wait=True)
                     
-                    # TRIGGER 2: HARD FIST (Toggle Gripper)
-                    elif rms_fist > THRESH_FIST:
-                        print(f"\n[ FIST TRIGGER ] Toggling Gripper...")
-                        
-                        gripper_open = not gripper_open # Flip boolean
-                        new_grip_val = GRIP_OPEN if gripper_open else GRIP_CLOSED
-                        
-                        # Read current full arm position, update only joint 6
-                        current_pose = controller.read_all_positions()
-                        current_pose[6] = new_grip_val
-                        
-                        # Move gripper fast
-                        controller.write_position(current_pose, speed=80, acceleration=50)
-                        last_trigger_time = time.time()
+                    if self.target_task != active_loc:
+                        print(f"\n[FSM] Interrupted at {active_loc}_bot. Forcing ABORT_RETRACT.")
+                        self.current_state = "ABORT_RETRACT"
+                    else:
+                        self.current_state = "ACTUATING_TARGET"
 
-            time.sleep(0.05)
+                elif self.current_state == "ACTUATING_TARGET":
+                    # Record intention
+                    intended_to_drop = self.holding_object
+                    
+                    # Actuate
+                    if intended_to_drop:
+                        self.arm.move_to(f"{active_loc}_bot_open", wait=True)
+                    else:
+                        self.arm.move_to(f"{active_loc}_bot_grip", wait=True)
+                    
+                    time.sleep(0.1) # Mechanical settling time before reading load
+                    self.holding_object = self.arm.is_grasping()
+                    
+                    # VERIFICATION CHECK
+                    if intended_to_drop and self.holding_object:
+                        print("\n[FAULT] Failed to drop object. Object stuck.")
+                        self.current_state = "ABORT_RETRACT"
+                    elif not intended_to_drop and not self.holding_object:
+                        print("\n[FAULT] Failed to grip object. Thin air grasped.")
+                        self.current_state = "ABORT_RETRACT"
+                    else:
+                        self.current_state = "ASCENDING_TARGET"
 
-    except KeyboardInterrupt:
-        print("\nShutting down manually.")
-    finally:
-        if board.is_prepared():
-            board.stop_stream()
-            board.release_session()
-        controller.disable_all_servos()
-        controller.disconnect()
-        print("Hardware safely disconnected.")
+                elif self.current_state == "ASCENDING_TARGET":
+                    wp = self._get_waypoint_name(active_loc, "top")
+                    self.arm.move_to(wp, wait=True)
+                    
+                    self.arm.move_to("home", wait=True)
+                    self.target_task = None
+                    active_loc = None
+                    self.current_state = "HOME"
+
+                # --- ESCAPE ROUTING ---
+                elif self.current_state == "ABORT_RETRACT":
+                    if active_loc:
+                        # Extract straight up from wherever we are
+                        wp_top = self._get_waypoint_name(active_loc, "top")
+                        self.arm.move_to(wp_top, wait=True)
+                    
+                    self.arm.move_to("home", wait=True)
+                    
+                    # Reset all tasks and state after clearing the workspace
+                    self.target_task = None
+                    active_loc = None
+                    self.current_state = "HOME"
+
+                time.sleep(0.02) # Yield thread
+
+        except Exception as e:
+            print(f"\nHardware Fault in FSM Loop: {e}")
+        finally:
+            self.running = False
+
+    def _keyboard_listener_thread(self):
+        """Reads raw keystrokes from Linux terminal without requiring 'Enter'."""
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(sys.stdin.fileno())
+            while self.running:
+                ch = sys.stdin.read(1)
+                
+                if ch == '1':
+                    self.target_task = "A"
+                    print("\r\n[Input] Command Received: Execute A")
+                elif ch == '2':
+                    self.target_task = "B"
+                    print("\r\n[Input] Command Received: Execute B")
+                elif ch == 'q':
+                    self.target_task = "ABORT"
+                    print("\r\n[Input] Command Received: ABORT!")
+                elif ch == '\x1b': # Escape key
+                    self.running = False
+                    print("\r\n[Input] Exit command received. Shutting down...")
+                    break
+                    
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 if __name__ == "__main__":
-    run_toggle_fsm()
+    arm = SO101ARM()
+    controller = FSMController(arm)
+    
+    try:
+        controller.start()
+    except KeyboardInterrupt:
+        print("\nProcess interrupted by user.")
+    finally:
+        controller.running = False
+        arm.disconnect()
